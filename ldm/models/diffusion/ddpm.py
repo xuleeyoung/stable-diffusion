@@ -500,7 +500,9 @@ class LatentDiffusion(DDPM):
             self.make_cond_schedule()
 
     def instantiate_first_stage(self, config):
-        model = instantiate_from_config(config)
+        # model = instantiate_from_config(config)
+        from diffusers import AutoencoderKL
+        model = AutoencoderKL.from_pretrained("SimianLuo/LCM_Dreamshaper_v7", subfolder="vae", use_safetensors=True)
         self.first_stage_model = model.eval()
         self.first_stage_model.train = disabled_train
         for param in self.first_stage_model.parameters():
@@ -694,6 +696,10 @@ class LatentDiffusion(DDPM):
             if self.use_positional_encodings:
                 pos_x, pos_y = self.compute_latent_shifts(batch)
                 c = {'pos_x': pos_x, 'pos_y': pos_y}
+        # print(z.shape)
+        # print(z)
+        # print(c.shape)
+        # print(c)
         out = [z, c]
         if return_first_stage_outputs:
             xrec = self.decode_first_stage(z)
@@ -752,15 +758,15 @@ class LatentDiffusion(DDPM):
                 return decoded
             else:
                 if isinstance(self.first_stage_model, VQModelInterface):
-                    return self.first_stage_model.decode(z, force_not_quantize=predict_cids or force_not_quantize)
+                    return self.first_stage_model.decode(z, force_not_quantize=predict_cids or force_not_quantize).sample
                 else:
-                    return self.first_stage_model.decode(z)
+                    return self.first_stage_model.decode(z).sample
 
         else:
             if isinstance(self.first_stage_model, VQModelInterface):
-                return self.first_stage_model.decode(z, force_not_quantize=predict_cids or force_not_quantize)
+                return self.first_stage_model.decode(z, force_not_quantize=predict_cids or force_not_quantize).sample
             else:
-                return self.first_stage_model.decode(z)
+                return self.first_stage_model.decode(z).sample
 
     # same as above but without decorator
     def differentiable_decode_first_stage(self, z, predict_cids=False, force_not_quantize=False):
@@ -860,7 +866,7 @@ class LatentDiffusion(DDPM):
             else:
                 return self.first_stage_model.encode(x)
         else:
-            return self.first_stage_model.encode(x)
+            return self.first_stage_model.encode(x).latent_dist.sample()
 
     def shared_step(self, batch, **kwargs):
         x, c = self.get_input(batch, self.first_stage_key)
@@ -1231,21 +1237,51 @@ class LatentDiffusion(DDPM):
                                   verbose=verbose, timesteps=timesteps, quantize_denoised=quantize_denoised,
                                   mask=mask, x0=x0)
 
+
     @torch.no_grad()
-    def sample_log(self,cond,batch_size,ddim, ddim_steps,**kwargs):
+    def sample_original(self, xc, batch_size, x_T, ddim_steps, **kwargs):
+        from diffusers import StableDiffusionPipeline
+        # import torchvision.transforms as transforms 
+        pipe = StableDiffusionPipeline.from_pretrained(
+            "SimianLuo/LCM_Dreamshaper_v7",
+            safety_checker = None,
+            requires_safety_checker = False
+        )
+        pipe.to(torch_device="cuda", torch_dtype=torch.float32)
+        num_inference_steps = 4
+        images = pipe(prompt=xc, latents=x_T, num_inference_steps=num_inference_steps, guidance_scale=8.0, lcm_origin_steps=50, output_type="latent").images
+        # print(images.shape)
+        # transform = transforms.Compose([ 
+        #     transforms.PILToTensor()
+        # ])
+        # for i in range(len(images)):
+        #     images[i].save(f"{i}.png")
+        # images = [transform(image) for image in images]
+        # images = torch.stack(images, dim=0)
+        # print(images.shape)
+        # images = images.type(torch.float32)
+        # print(images)
+        return images
+
+
+    @torch.no_grad()
+    def sample_log(self,cond,xc,batch_size,ddim, ddim_steps,**kwargs):
+        shape = (batch_size, self.channels, self.image_size, self.image_size)
+        x_T = torch.randn(shape, device=self.device)
 
         if ddim:
             ddim_sampler = DDIMSampler(self)
             shape = (self.channels, self.image_size, self.image_size)
             samples, intermediates =ddim_sampler.sample(ddim_steps,batch_size,
-                                                        shape,cond,verbose=False,**kwargs)
+                                                        shape,cond,verbose=False, x_T=x_T, **kwargs)
 
         else:
             samples, intermediates = self.sample(cond=cond, batch_size=batch_size,
-                                                 return_intermediates=True,**kwargs)
+                                                 return_intermediates=True, x_T=x_T, **kwargs)
+        
+        origin_samples = self.sample_original(xc=xc, batch_size=batch_size,x_T=x_T, ddim_steps=ddim_steps, **kwargs)
 
-        return samples, intermediates
-
+        return samples, intermediates, origin_samples
 
     @torch.no_grad()
     def log_images(self, batch, N=8, n_row=4, sample=True, ddim_steps=200, ddim_eta=1., return_keys=None,
@@ -1264,6 +1300,7 @@ class LatentDiffusion(DDPM):
         n_row = min(x.shape[0], n_row)
         log["inputs"] = x
         log["reconstruction"] = xrec
+        origin_xc = xc[:N]
         if self.model.conditioning_key is not None:
             if hasattr(self.cond_stage_model, "decode"):
                 xc = self.cond_stage_model.decode(c)
@@ -1300,11 +1337,12 @@ class LatentDiffusion(DDPM):
         if sample:
             # get denoise row
             with self.ema_scope("Plotting"):
-                samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
+                samples, z_denoise_row, origin_images = self.sample_log(cond=c,xc=origin_xc,batch_size=N,ddim=use_ddim,
                                                          ddim_steps=ddim_steps,eta=ddim_eta)
                 # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True)
             x_samples = self.decode_first_stage(samples)
             log["samples"] = x_samples
+            log["origin_images"] = self.decode_first_stage(origin_images)
             if plot_denoise_rows:
                 denoise_grid = self._get_denoise_row_from_list(z_denoise_row)
                 log["denoise_row"] = denoise_grid
@@ -1313,7 +1351,7 @@ class LatentDiffusion(DDPM):
                     self.first_stage_model, IdentityFirstStage):
                 # also display when quantizing x0 while sampling
                 with self.ema_scope("Plotting Quantized Denoised"):
-                    samples, z_denoise_row = self.sample_log(cond=c,batch_size=N,ddim=use_ddim,
+                    samples, z_denoise_row, origin_images = self.sample_log(cond=c,xc=origin_xc,batch_size=N,ddim=use_ddim,
                                                              ddim_steps=ddim_steps,eta=ddim_eta,
                                                              quantize_denoised=True)
                     # samples, z_denoise_row = self.sample(cond=c, batch_size=N, return_intermediates=True,
@@ -1330,7 +1368,7 @@ class LatentDiffusion(DDPM):
                 mask = mask[:, None, ...]
                 with self.ema_scope("Plotting Inpaint"):
 
-                    samples, _ = self.sample_log(cond=c,batch_size=N,ddim=use_ddim, eta=ddim_eta,
+                    samples, _, origin_images = self.sample_log(cond=c,batch_size=N,ddim=use_ddim, eta=ddim_eta,
                                                 ddim_steps=ddim_steps, x0=z[:N], mask=mask)
                 x_samples = self.decode_first_stage(samples.to(self.device))
                 log["samples_inpainting"] = x_samples
@@ -1338,7 +1376,7 @@ class LatentDiffusion(DDPM):
 
                 # outpaint
                 with self.ema_scope("Plotting Outpaint"):
-                    samples, _ = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,eta=ddim_eta,
+                    samples, _, origin_images = self.sample_log(cond=c, batch_size=N, ddim=use_ddim,eta=ddim_eta,
                                                 ddim_steps=ddim_steps, x0=z[:N], mask=mask)
                 x_samples = self.decode_first_stage(samples.to(self.device))
                 log["samples_outpainting"] = x_samples
